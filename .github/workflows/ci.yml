@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Restore
+        run: dotnet restore ATS.sln
+
+      - name: Build
+        run: dotnet build ATS.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test ATS.sln --configuration Release --no-build --verbosity normal
