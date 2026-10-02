@@ -16,9 +16,9 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
-    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.10.*" />
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.10.1" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.14" />
-    <PackageReference Include="OllamaSharp" Version="*" />
+    <PackageReference Include="OllamaSharp" Version="5.5.0" />
     <PackageReference Include="PdfPig" Version="0.1.14" />
     <PackageReference Include="QuestPDF" Version="2026.2.4" />
     <PackageReference Include="Serilog" Version="4.3.1" />
