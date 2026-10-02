@@ -1,25 +1,31 @@
 ﻿using ATS.Application.Abstract.Services;
+using ATS.Application.Reporting;
+using ATS.Application.Results;
+using ATS.Application.Security;
 using ATS.Domain.Entities;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace ATS.FromUI
 {
     public partial class Form1 : Form
     {
-        private readonly ICvScanService _cvScanService;
-        private readonly IReportService _reportService;
+        private readonly IServiceScopeFactory _scopeFactory;
         private readonly ILogger<Form1> _logger;
         private string? _uploadedFilePath;
         private string? _uploadedFileName;
         private string? _uploadedFileType;
         private string? _lastReportPath;
         private CvScan? _selectedScan;
-        public Form1(ICvScanService cvScanService, IReportService reportService, ILogger<Form1> logger)
+        private CancellationTokenSource? _analysisCts;
+        public Form1(IServiceScopeFactory scopeFactory, IReportService reportService, ILogger<Form1> logger)
         {
             InitializeComponent();
-            _cvScanService = cvScanService;
-            _reportService = reportService;
+            _scopeFactory = scopeFactory;
             _logger = logger;
+
+            // Form kapanırken süren analiz iptal edilir.
+            //FormClosing += Form1_FormClosing;
         }
 
         private async void Form1_Load(object sender, EventArgs e)
@@ -83,7 +89,10 @@ namespace ATS.FromUI
         {
             try
             {
-                var scans = (await _cvScanService.GetAllScansAsync()).OrderByDescending(s => s.CreatedAt).ToList();
+                using var scope = _scopeFactory.CreateScope();
+                var cvScanService = scope.ServiceProvider.GetRequiredService<ICvScanService>();
+
+                var scans = (await cvScanService.GetAllScansAsync()).OrderByDescending(s => s.CreatedAt).ToList();
                 var rows = scans.Select(s => new
                 {
                     s.Id,
@@ -92,7 +101,7 @@ namespace ATS.FromUI
                                     : "No File Name",
                     s.OverallScore,
                     AnalysisType = s.IsJobMatched ? "Job Match" : " Gen. ATS Score",
-                    s.CreatedAt
+                    CreatedAt = s.CreatedAt.ToLocalTime()
                 }).ToList();
                 dtgAllAnalyze.DataSource = rows;
             }
@@ -139,6 +148,11 @@ namespace ATS.FromUI
                 MessageBox.Show("Please upload a CV file first.", "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+
+            _analysisCts?.Dispose();
+            _analysisCts = new CancellationTokenSource();
+            var cancellationToken = _analysisCts.Token;
+
             SetBusyState(true);
             ResetResultArea();
 
@@ -146,52 +160,80 @@ namespace ATS.FromUI
             {
                 await SimulateProgressAsync(0, 30, 300);
 
-                CvScan result;
-                string title = txtJobTitle.Text.Trim();
                 string jobRequirementsText = txtJobRequitments.Text.Trim();
                 bool isJobMatch = !string.IsNullOrWhiteSpace(jobRequirementsText);
 
                 await SimulateProgressAsync(30, 60, 200);
 
-                if (isJobMatch)
-                {
-                    string finalJobTitle = !string.IsNullOrWhiteSpace(txtJobTitle.Text)
-                           ? txtJobTitle.Text.Trim()
-                           : ExtractJobTitle(jobRequirementsText);
+                AnalysisResult analysisResult;
+                CvScan scan;
 
-                    result = await _cvScanService.AnalyzeWithJobPostingAsync(_uploadedFilePath, _uploadedFileType, jobRequirementsText, finalJobTitle);
-                }
-                else
+                // Her işlem kendi DI kapsamında çalışır; DbContext işlemler arasında paylaşılmaz.
+                using (var scope = _scopeFactory.CreateScope())
                 {
-                    result = await _cvScanService.AnalyzeAsync(_uploadedFilePath, _uploadedFileType);
+                    var cvScanService = scope.ServiceProvider.GetRequiredService<ICvScanService>();
+
+                    if (isJobMatch)
+                    {
+                        string finalJobTitle = !string.IsNullOrWhiteSpace(txtJobTitle.Text)
+                               ? txtJobTitle.Text.Trim()
+                               : ExtractJobTitle(jobRequirementsText);
+
+                        analysisResult = await cvScanService.AnalyzeWithJobPostingAsync(
+                            _uploadedFilePath, _uploadedFileType, jobRequirementsText, finalJobTitle, cancellationToken);
+                    }
+                    else
+                    {
+                        analysisResult = await cvScanService.AnalyzeAsync(_uploadedFilePath, _uploadedFileType, cancellationToken);
+                    }
+
+                    // Kapsam kapanınca ilişkiler yüklenemez; raporun okuyacağı her şey burada önceden yüklenir.
+                    scan = await cvScanService.GetScanWithDetailsAsync(analysisResult.Scan.Id) ?? analysisResult.Scan;
                 }
+
                 await SimulateProgressAsync(60, 90, 200);
 
-                _selectedScan = result;
-                _lastReportPath = result.ScoreReports?.FirstOrDefault()?.ReportPath;
+                _selectedScan = scan;
+                _lastReportPath = scan.ScoreReports?.FirstOrDefault()?.ReportPath;
 
                 lblMaxScore.Text = "100";
-                lblScore.Text = result.OverallScore.ToString();
-                lblName.Text = !string.IsNullOrWhiteSpace(result.CandidateName) ? result.CandidateName : "Unknown Candidate";
-                txtFeedback.Text = BuildFeedbackText(result);
+                lblScore.Text = scan.OverallScore.ToString();
+                lblName.Text = !string.IsNullOrWhiteSpace(scan.CandidateName) ? scan.CandidateName : "Unknown Candidate";
+                txtFeedback.Text = BuildFeedbackText(scan);
 
                 await SimulateProgressAsync(90, 100, 150);
 
-                SetStatusMessage($"✅ Analysis complete — Score: {result.OverallScore}/100", Color.ForestGreen);
+                bool hasWarnings = analysisResult.Warnings.Count > 0;
+                if (hasWarnings)
+                    SetStatusMessage($"⚠️ Analysis complete with warnings — Score: {scan.OverallScore}/100", Color.DarkOrange);
+                else
+                    SetStatusMessage($"✅ Analysis complete — Score: {scan.OverallScore}/100", Color.ForestGreen);
 
                 btnPdfReport.Enabled = true;
                 await LoadAnalyzeHistoryAsync();
 
-                _logger.LogInformation("Analysis done. Mode={Mode}, CvScanId={Id}, Score={Score}", isJobMatch ? "JobMatch" : "General", result.Id, result.OverallScore);
+                _logger.LogInformation("Analysis done. Mode={Mode}, CvScanId={Id}, Score={Score}", isJobMatch ? "JobMatch" : "General", scan.Id, scan.OverallScore);
+
+                var securityMessage = SecurityFindingMessageFormatter.Format(analysisResult.SecurityFindings);
+                if (securityMessage != null)
+                    MessageBox.Show(securityMessage, "Security findings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+                if (hasWarnings)
+                {
+                    var warningText = string.Join(Environment.NewLine, analysisResult.Warnings.Select(warning => "• " + warning));
+                    MessageBox.Show(warningText, "Analysis warnings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("Analysis cancelled");
+                SetStatusMessage("Analysis cancelled.", Color.Gray);
+                progressAnalyzeTime.Value = 0;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Analysis failed");
-                string fullError = ex.ToString();
-                if (ex.InnerException != null)
-                    fullError += "\n\nINNER: " + ex.InnerException.ToString();
-
-                MessageBox.Show(fullError, "Analysis failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(ex.Message, "Analysis failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
 
                 SetStatusMessage("❌ Analysis failed: " + ex.Message, Color.Crimson);
                 progressAnalyzeTime.Value = 0;
@@ -219,9 +261,12 @@ namespace ATS.FromUI
 
             try
             {
+                using var scope = _scopeFactory.CreateScope();
+                var reportService = scope.ServiceProvider.GetRequiredService<IReportService>();
+
                 string reportPath = target.IsJobMatched
-                    ? _reportService.GenerateJobMatchReport(target)
-                    : _reportService.GenerateGeneralReport(target);
+                    ? reportService.GenerateJobMatchReport(target)
+                    : reportService.GenerateGeneralReport(target);
 
                 _lastReportPath = reportPath;
                 SetStatusMessage($"📄 PDF successfully generated: {Path.GetFileName(reportPath)}", Color.SteelBlue);
@@ -254,7 +299,13 @@ namespace ATS.FromUI
                 var row = dtgAllAnalyze.Rows[e.RowIndex];
                 int scanId = Convert.ToInt32(row.Cells["colId"].Value);
 
-                CvScan? scan = await _cvScanService.GetScanWithDetailsAsync(scanId);
+                CvScan? scan;
+                using (var scope = _scopeFactory.CreateScope())
+                {
+                    var cvScanService = scope.ServiceProvider.GetRequiredService<ICvScanService>();
+                    scan = await cvScanService.GetScanWithDetailsAsync(scanId);
+                }
+
                 if (scan == null) return;
 
                 _selectedScan = scan;
@@ -266,6 +317,7 @@ namespace ATS.FromUI
                 txtFeedback.Text = BuildFeedbackText(scan);
 
                 txtJobRequitments.Text = scan.JobPosting?.RawText ?? string.Empty;
+                txtJobTitle.Text = scan.JobPosting?.Title ?? string.Empty;
                 progressAnalyzeTime.Value = Math.Min(scan.OverallScore, 100);
                 btnPdfReport.Enabled = true;
 
@@ -290,6 +342,8 @@ namespace ATS.FromUI
             sb.AppendLine("══════════════════════════════════");
             sb.AppendLine($"  TOTAL SCORE: {scan.OverallScore}/100");
             sb.AppendLine($"  Analysis Type: {(scan.IsJobMatched ? "Job Match" : "Gen ATS Analysis")}");
+            if (scan.IsJobMatched)
+                sb.AppendLine($"  {OverallScoreExplanation.Build()}");
             sb.AppendLine("══════════════════════════════════");
             sb.AppendLine();
 
@@ -312,11 +366,51 @@ namespace ATS.FromUI
                 sb.AppendLine();
             }
 
-            if (scan.IsJobMatched && scan.JobPosting != null)
+            // Job Match puanı doğrudan bölüm skorundan okunur.
+            var jobMatchSection = scan.SectionScores.FirstOrDefault(s => s.SectionName == OverallScoreCalculator.JobMatchSectionName);
+            if (scan.IsJobMatched && jobMatchSection != null)
             {
-                sb.AppendLine($"🎯 Job Match Score: {scan.JobPosting.MatchScore}/20");
-                if (!string.IsNullOrWhiteSpace(scan.JobPosting.Title))
-                    sb.AppendLine($"   Position: {scan.JobPosting.Title}");
+                sb.AppendLine($"🎯 Job Match Score: {jobMatchSection.Score}/{jobMatchSection.MaxScore}");
+                if (!string.IsNullOrWhiteSpace(scan.JobPosting?.Title))
+                    sb.AppendLine($"   Position: {scan.JobPosting!.Title}");
+                sb.AppendLine();
+            }
+
+            var requirementReportLines = RequirementReportFormatter.FormatLines(RequirementReportBuilder.Build(scan));
+            if (requirementReportLines.Count > 0)
+            {
+                foreach (var requirementReportLine in requirementReportLines)
+                    sb.AppendLine(requirementReportLine);
+                sb.AppendLine();
+            }
+
+            var hiddenTextLines = SecurityReportLineBuilder.BuildHiddenTextLines(scan.SecurityFindings);
+            if (hiddenTextLines.Count > 0)
+            {
+                sb.AppendLine($" {SecurityReportTexts.HiddenTextSectionTitle}");
+                sb.AppendLine($"   {SecurityReportTexts.HiddenTextSectionNote}");
+                foreach (var hiddenTextLine in hiddenTextLines)
+                    sb.AppendLine($"   • [{hiddenTextLine.Severity}] {hiddenTextLine.Text}");
+                sb.AppendLine();
+            }
+
+            var securityLines = SecurityReportLineBuilder.BuildFindingLines(scan.SecurityFindings);
+            if (securityLines.Count > 0)
+            {
+                sb.AppendLine($"️ {SecurityReportTexts.SecuritySectionTitle}");
+                sb.AppendLine($"   {SecurityReportTexts.SecuritySectionNote}");
+                foreach (var securityLine in securityLines)
+                    sb.AppendLine($"   • [{securityLine.Severity}] {securityLine.Text}");
+                sb.AppendLine();
+            }
+
+            var warningLines = SecurityReportLineBuilder.BuildWarningLines(scan.AnalysisWarnings).ToList();
+            if (warningLines.Count > 0)
+            {
+                sb.AppendLine("⚠️ Analysis warnings");
+                foreach (var warningLine in warningLines)
+                    sb.AppendLine($"   • {warningLine}");
+                sb.AppendLine();
             }
 
             return sb.ToString();
@@ -347,7 +441,8 @@ namespace ATS.FromUI
             btnAnalyze.Enabled = !busy;
             btnNewAnalyze.Enabled = !busy;
             btnClean.Enabled = !busy;
-            btnPdfReport.Enabled = !busy;
+            // Analiz hata verirse ya da iptal edilirse eski analizin raporu üretilmesin.
+            btnPdfReport.Enabled = !busy && _selectedScan != null;
             txtJobRequitments.Enabled = !busy;
             Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         }
@@ -367,9 +462,10 @@ namespace ATS.FromUI
             lblScore.Text = "—";
             lblName.Text = "—";
             txtFeedback.Text = string.Empty;
-            txtJobTitle.Text = string.Empty;
             progressAnalyzeTime.Value = 0;
             btnPdfReport.Enabled = false;
+            _selectedScan = null;
+            _lastReportPath = null;
         }
 
         private void ResetForm()
@@ -378,18 +474,21 @@ namespace ATS.FromUI
             txtJobRequitments.Text = string.Empty;
             txtJobTitle.Text = string.Empty;
             _uploadedFilePath = null;
+            _uploadedFileName = null;
             _uploadedFileType = null;
-            _lastReportPath = null;
-            _selectedScan = null;
             btnAnalyze.Enabled = false;
             SetStatusMessage(string.Empty, Color.Gray);
         }
 
         private void SetStatusMessage(string message, Color color)
         {
-
             lblStatus.ForeColor = color;
             lblStatus.Text = message;
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            _analysisCts?.Cancel();
         }
     }
 

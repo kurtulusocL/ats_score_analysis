@@ -1,55 +1,51 @@
-﻿using ATS.Application.Analyzers.Base;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using ATS.Application.Analyzers.Base;
 using ATS.Application.Analyzers.Base.Models;
 using ATS.Application.Results;
 
-namespace ATS.Application.Analyzers
+namespace ATS.Application.Analyzers;
+
+public class ScoringOrchestrator
 {
-    public class ScoringOrchestrator
-    {
-        private readonly IEnumerable<IAnalyzer> _analyzers;
+	private readonly IEnumerable<IAnalyzer> _analyzers;
 
-        public ScoringOrchestrator(IEnumerable<IAnalyzer> analyzers)
-        {
-            _analyzers = analyzers;
-        }
+	public ScoringOrchestrator(IEnumerable<IAnalyzer> analyzers)
+	{
+		_analyzers = analyzers;
+	}
 
-        public OrchestratorResult Run(string cvText, string fileName, string? jobDescription = null)
-        {
-            var results = new List<AnalyzerResult>();
+	public OrchestratorResult Run(string cvText, string fileName, string? jobDescription = null)
+	{
+		List<AnalyzerResult> list = new List<AnalyzerResult>();
+		foreach (IAnalyzer analyzer in _analyzers)
+		{
+			if (!(analyzer.SectionName == "Job Match") || !string.IsNullOrWhiteSpace(jobDescription))
+			{
+				AnalyzerResult item = analyzer.Analyze(cvText, jobDescription);
+				list.Add(item);
+			}
+		}
+		return BuildResult(list, fileName);
+	}
 
-            foreach (var analyzer in _analyzers)
-            {
-                if (analyzer.SectionName == "Job Match" && string.IsNullOrWhiteSpace(jobDescription))
-                    continue;
-
-                var result = analyzer.Analyze(cvText, jobDescription);
-                results.Add(result);
-            }
-            return BuildResult(results, fileName);
-        }
-
-        private OrchestratorResult BuildResult(List<AnalyzerResult> results, string fileName)
-        {
-            var hasJobMatch = results.Any(r => r.SectionName == "Job Match");
-            if (!hasJobMatch)
-            {
-                foreach (var res in results)
-                {
-                    res.Score = (int)Math.Round(res.Score * 1.25);
-                    res.MaxScore = (int)Math.Round(res.MaxScore * 1.25);
-                }
-            }
-            var totalScore = results.Sum(r => r.Score);
-            var totalMaxScore = results.Sum(r => r.MaxScore);
-
-            return new OrchestratorResult
-            {
-                FileName = fileName,
-                AnalyzerResults = results,
-                TotalScore = Math.Min(totalScore, 100),
-                TotalMaxScore = 100,
-                IsGenerallyPassed = totalScore >= 60
-            };
-        }
-    }
+	private OrchestratorResult BuildResult(List<AnalyzerResult> results, string fileName)
+	{
+		if (!results.Any((AnalyzerResult r) => r.SectionName == "Job Match"))
+		{
+			foreach (AnalyzerResult result in results)
+			{
+				result.Score = (int)Math.Round((double)result.Score * 1.25);
+				result.MaxScore = (int)Math.Round((double)result.MaxScore * 1.25);
+			}
+		}
+		OrchestratorResult orchestratorResult = new OrchestratorResult
+		{
+			FileName = fileName,
+			AnalyzerResults = results
+		};
+		orchestratorResult.RecalculateTotals();
+		return orchestratorResult;
+	}
 }

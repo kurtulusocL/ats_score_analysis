@@ -1,10 +1,13 @@
-﻿
-namespace ATS.Application.Abstract.Services
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace ATS.Application.Abstract.Services;
+
+public interface ITranslatorService
 {
-    public interface ITranslatorService
-    {
-        Task<string> DetectLanguageAsync(string text);
-        Task<string> TranslateAsync(string text, string targetLanguage = "en");
-        Task<string> GetAnalysisTextAsync(string rawText);
-    }
+	Task<string> DetectLanguageAsync(string text, CancellationToken cancellationToken = default(CancellationToken));
+
+	Task<string> TranslateAsync(string text, string targetLanguage = "en", CancellationToken cancellationToken = default(CancellationToken));
+
+	Task<string> GetAnalysisTextAsync(string rawText, CancellationToken cancellationToken = default(CancellationToken));
 }

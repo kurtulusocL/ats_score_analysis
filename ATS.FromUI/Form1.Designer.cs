@@ -349,6 +349,7 @@
             Name = "Form1";
             StartPosition = FormStartPosition.CenterScreen;
             Text = "ATS Score Analyzer";
+            FormClosing += Form1_FormClosing;
             Load += Form1_Load;
             ((System.ComponentModel.ISupportInitialize)dtgAllAnalyze).EndInit();
             groupBox1.ResumeLayout(false);
